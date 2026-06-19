@@ -169,18 +169,34 @@ def parse_bank(filepath: str) -> pd.DataFrame:
         booking_date = row[col_map["booking_date"]].strip().strip('"') if "booking_date" in col_map else ""
         iban = row[col_map["iban"]].strip().strip('"') if "iban" in col_map else ""
 
+        # Try to get month from purpose text first, then fall back to booking date
         ym = extract_month_from_text(purpose)
         year = ym[0] if ym else None
         month = ym[1] if ym else None
 
+        # Parse booking date to get booking_year / booking_month
+        booking_year = None
+        booking_month = None
+        if booking_date:
+            # Formats: DD.MM.YY  or  DD.MM.YYYY
+            bd_m = re.match(r"(\d{1,2})\.(\d{1,2})\.(\d{2,4})", booking_date)
+            if bd_m:
+                d_year = int(bd_m.group(3))
+                if d_year < 100:
+                    d_year += 2000
+                booking_year = d_year
+                booking_month = int(bd_m.group(2))
+
         records.append({
             "booking_date": booking_date,
+            "booking_year": booking_year,
+            "booking_month": booking_month,
             "recipient": recipient,
             "purpose": purpose,
             "amount": amount,
             "iban": iban,
-            "year": year,
-            "month": month,
+            "year": year,      # from purpose text
+            "month": month,    # from purpose text
         })
 
     return pd.DataFrame(records)
