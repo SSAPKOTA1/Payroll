@@ -258,110 +258,143 @@ with tab_main:
     else:
         selected_emp_name = st.selectbox("Select employee", emp_options)
         emp_row = result_df[result_df["employee_name"] == selected_emp_name].iloc[0]
-        emp_id = emp_row["employee_id"]
-        ov = overrides.get(emp_id, {})
+        emp_id  = emp_row["employee_id"]
+
+        # ── Cross-company view for this employee in the selected month ──────
+        st.divider()
+        st.subheader(f"All Companies — {selected_emp_name} — {selected_month_label}")
+        st.caption("This employee may receive salary from multiple companies. "
+                   "Each company is matched and tracked independently.")
+
+        # Build per-company result for this employee across all companies in the month
+        all_companies_month_df = payroll_df_raw[
+            (payroll_df_raw["employee_id"] == emp_id)
+        ].copy()
+
+        cross_company_rows = []
+        for _, row in all_companies_month_df.iterrows():
+            company = row["company"]
+            ov_c = get_override(company, emp_id, sel_year, sel_month)
+            gross = ov_c.get("gross_override") or row["gross_salary"]
+            net   = ov_c.get("net_override")   or row["net_salary"]
+
+            # Match bank transfers for this company
+            emp_single = pd.DataFrame([{**row.to_dict(), "gross_salary": gross, "net_salary": net}])
+            res_single = match_transfers(emp_single, bank_df, sel_year, sel_month)
+            if res_single.empty:
+                continue
+            r = res_single.iloc[0]
+
+            paid = ov_c.get("paid_amount_override") if ov_c.get("paid_amount_override") is not None else r["paid_amount"]
+            if ov_c.get("paid_override") == 1:
+                paid = net
+            elif ov_c.get("paid_override") == 0:
+                paid = 0.0
+            paid = float(paid)
+
+            status = compute_status(paid, float(net))
+            cross_company_rows.append({
+                "Company":      company,
+                "Gross":        f"€{float(gross):,.2f}",
+                "Net":          f"€{float(net):,.2f}",
+                "Paid":         f"€{paid:,.2f}",
+                "Pending":      f"€{max(0.0, float(net)-paid):,.2f}",
+                "Status":       status,
+                "Bank Ref":     r.get("bank_reference", "")[:60],
+                "Currently selected": "← selected" if company == selected_company else "",
+            })
+
+        if cross_company_rows:
+            cc_df = pd.DataFrame(cross_company_rows)
+            st.dataframe(cc_df, use_container_width=True, hide_index=True)
+            total_net_all  = sum(float(r["Net"].replace("€","").replace(",","")) for r in cross_company_rows)
+            total_paid_all = sum(float(r["Paid"].replace("€","").replace(",","")) for r in cross_company_rows)
+            st.markdown(
+                f"**Total net across all companies:** €{total_net_all:,.2f} &nbsp;|&nbsp; "
+                f"**Total paid:** €{total_paid_all:,.2f} &nbsp;|&nbsp; "
+                f"**Total pending:** €{max(0, total_net_all - total_paid_all):,.2f}"
+            )
+        else:
+            st.info("No cross-company data found.")
+
+        # ── Per-company override (for the selected company) ─────────────────
+        st.divider()
+        st.subheader(f"Override — {selected_company}")
+        ov = get_override(selected_company, emp_id, sel_year, sel_month)
 
         col_a, col_b = st.columns(2)
-
         with col_a:
-            st.markdown("#### Current Values")
+            st.markdown("#### Current Values (selected company)")
             st.write(f"**Employee ID:** {emp_id}")
             st.write(f"**Status:** {status_badge(emp_row['status'])}")
-            st.write(f"**Gross Salary:** €{emp_row['gross_salary']:,.2f}")
-            st.write(f"**Net Salary:** €{emp_row['net_salary']:,.2f}")
-            st.write(f"**Amount Paid:** €{emp_row['paid_amount']:,.2f}")
+            st.write(f"**Gross:** €{emp_row['gross_salary']:,.2f}")
+            st.write(f"**Net:** €{emp_row['net_salary']:,.2f}")
+            st.write(f"**Paid:** €{emp_row['paid_amount']:,.2f}")
             st.write(f"**Difference:** €{emp_row['difference']:,.2f} ({emp_row['difference_pct']:.1f}%)")
             st.write(f"**Pending:** €{emp_row['pending_amount']:,.2f}")
             if emp_row.get("bank_reference"):
-                st.write(f"**Bank Reference:** {emp_row['bank_reference']}")
-            if emp_row.get("match_reason"):
-                st.caption(f"Match reason: {emp_row['match_reason']}")
+                st.write(f"**Bank Ref:** {emp_row['bank_reference']}")
 
         with col_b:
             st.markdown("#### Manual Override")
-
-            with st.form(f"override_form_{emp_id}"):
-                new_gross = st.number_input(
-                    "Gross Salary Override",
+            with st.form(f"override_form_{emp_id}_{selected_company}"):
+                new_gross = st.number_input("Gross Salary Override",
                     value=float(ov.get("gross_override") or emp_row["gross_salary"]),
-                    min_value=0.0, step=0.01, format="%.2f"
-                )
-                new_net = st.number_input(
-                    "Net Salary Override",
+                    min_value=0.0, step=0.01, format="%.2f")
+                new_net = st.number_input("Net Salary Override",
                     value=float(ov.get("net_override") or emp_row["net_salary"]),
-                    min_value=0.0, step=0.01, format="%.2f"
-                )
-
-                use_net_as_paid = st.checkbox(
-                    "✔ Use Net Salary as Amount Paid",
+                    min_value=0.0, step=0.01, format="%.2f")
+                use_net_as_paid = st.checkbox("✔ Use Net Salary as Amount Paid",
                     value=(ov.get("paid_amount_override") is not None and
-                           abs(ov.get("paid_amount_override", 0) - emp_row["net_salary"]) < 0.01)
-                )
-
-                new_paid = st.number_input(
-                    "Amount Paid Override",
+                           abs(ov.get("paid_amount_override", 0) - emp_row["net_salary"]) < 0.01))
+                new_paid = st.number_input("Amount Paid Override",
                     value=float(ov.get("paid_amount_override") or emp_row["paid_amount"]),
-                    min_value=0.0, step=0.01, format="%.2f",
-                    disabled=use_net_as_paid,
-                )
-
-                paid_override_opt = st.radio(
-                    "Payment Status Override",
+                    min_value=0.0, step=0.01, format="%.2f", disabled=use_net_as_paid)
+                paid_override_opt = st.radio("Payment Status Override",
                     options=["Auto (from bank data)", "Force Paid", "Force Not Paid"],
                     index=(1 if ov.get("paid_override") == 1 else
-                           2 if ov.get("paid_override") == 0 else 0),
-                )
-
+                           2 if ov.get("paid_override") == 0 else 0))
                 submitted = st.form_submit_button("💾 Save Override", use_container_width=True)
                 clear_btn = st.form_submit_button("🗑 Clear Override", use_container_width=True)
 
                 if submitted:
-                    paid_ov_val = None
-                    if paid_override_opt == "Force Paid":
-                        paid_ov_val = 1
-                    elif paid_override_opt == "Force Not Paid":
-                        paid_ov_val = 0
-                    paid_amount_ov = new_net if use_net_as_paid else new_paid
-                    set_override(
-                        selected_company, emp_id, sel_year, sel_month,
-                        gross_override=new_gross,
-                        net_override=new_net,
-                        paid_amount_override=paid_amount_ov,
-                        paid_override=paid_ov_val,
-                    )
-                    st.success("Override saved. Refresh to see updated values.")
+                    paid_ov_val = (1 if paid_override_opt == "Force Paid" else
+                                   0 if paid_override_opt == "Force Not Paid" else None)
+                    set_override(selected_company, emp_id, sel_year, sel_month,
+                        gross_override=new_gross, net_override=new_net,
+                        paid_amount_override=new_net if use_net_as_paid else new_paid,
+                        paid_override=paid_ov_val)
+                    st.success("Override saved.")
                     st.cache_data.clear()
-
                 if clear_btn:
                     clear_override(selected_company, emp_id, sel_year, sel_month)
                     st.info("Override cleared.")
                     st.cache_data.clear()
 
-        # Payroll history
+        # ── Payroll history across ALL companies and ALL months ──────────────
         st.divider()
-        st.subheader(f"Payroll History — {selected_emp_name}")
+        st.subheader(f"Full Payroll History — {selected_emp_name} (all companies)")
         history_rows = []
         for (hy, hm), h_entries in sorted(month_to_entries.items()):
-            df_raw = load_payroll_for_month(
+            df_raw_h = load_payroll_for_month(
                 [(e["path"], e["year"], e["month"]) for e in h_entries]
             )
-            if df_raw.empty:
+            if df_raw_h.empty:
                 continue
-            emp_hist = df_raw[(df_raw["employee_id"] == emp_id) &
-                              (df_raw["company"] == selected_company)]
-            if not emp_hist.empty:
-                r = emp_hist.iloc[0]
-                ov_h = get_override(selected_company, emp_id, hy, hm)
-                gross = ov_h.get("gross_override") or r["gross_salary"]
-                net = ov_h.get("net_override") or r["net_salary"]
+            emp_all = df_raw_h[df_raw_h["employee_id"] == emp_id]
+            for _, hr in emp_all.iterrows():
+                ov_h = get_override(hr["company"], emp_id, hy, hm)
+                gross = ov_h.get("gross_override") or hr["gross_salary"]
+                net   = ov_h.get("net_override")   or hr["net_salary"]
                 history_rows.append({
-                    "Month": f"{calendar.month_name[hm]} {hy}",
-                    "Gross": f"€{gross:,.2f}",
-                    "Net": f"€{net:,.2f}",
-                    "Files": len(h_entries),
+                    "Month":   f"{calendar.month_name[hm]} {hy}",
+                    "Company": hr["company"],
+                    "Gross":   f"€{float(gross):,.2f}",
+                    "Net":     f"€{float(net):,.2f}",
                 })
         if history_rows:
-            st.dataframe(pd.DataFrame(history_rows), use_container_width=True, hide_index=True)
+            hist_df = pd.DataFrame(history_rows)
+            st.dataframe(hist_df, use_container_width=True, hide_index=True)
         else:
             st.info("No history found for this employee.")
 
