@@ -73,42 +73,74 @@ if not payroll_entries:
     st.stop()
 
 # ---------------------------------------------------------------------------
+# Group payroll files by (year, month) — a single month may have multiple
+# files (e.g. one per company / department).
+# ---------------------------------------------------------------------------
+from collections import defaultdict
+month_to_entries: dict = defaultdict(list)
+for e in payroll_entries:
+    month_to_entries[(e["year"], e["month"])].append(e)
+
+# Unique sorted month keys
+unique_months = sorted(month_to_entries.keys())
+
+# ---------------------------------------------------------------------------
 # Month selector
 # ---------------------------------------------------------------------------
-month_labels = [
-    f"{calendar.month_name[e['month']]} {e['year']}" for e in payroll_entries
-]
+month_labels = [f"{calendar.month_name[m]} {y}" for y, m in unique_months]
 default_idx = len(month_labels) - 1  # most recent
 
 selected_month_label = st.sidebar.selectbox(
     "Select payroll month", month_labels, index=default_idx
 )
-selected_entry = payroll_entries[month_labels.index(selected_month_label)]
-sel_year, sel_month = selected_entry["year"], selected_entry["month"]
+sel_year, sel_month = unique_months[month_labels.index(selected_month_label)]
 
 # ---------------------------------------------------------------------------
-# Load payroll for selected month
+# Load ALL payroll files for the selected month and merge
 # ---------------------------------------------------------------------------
-payroll_df_raw = load_payroll(selected_entry["path"], sel_year, sel_month)
+entries_for_month = month_to_entries[(sel_year, sel_month)]
+
+@st.cache_data(show_spinner="Parsing payroll files…")
+def load_payroll_for_month(paths_years_months: list) -> pd.DataFrame:
+    frames = []
+    for path, year, month in paths_years_months:
+        df = parse_payroll(path, year, month)
+        if not df.empty:
+            df["source_file"] = os.path.basename(path)
+            frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+# Pass as a list of tuples (hashable for cache key)
+payroll_df_raw = load_payroll_for_month(
+    [(e["path"], e["year"], e["month"]) for e in entries_for_month]
+)
 
 if payroll_df_raw.empty:
-    st.error(f"Could not parse payroll file: {selected_entry['path']}")
+    st.error(f"Could not parse any payroll file for {selected_month_label}.")
     st.stop()
 
-companies = payroll_df_raw["company"].unique().tolist()
+companies = sorted(payroll_df_raw["company"].unique().tolist())
 selected_company = st.sidebar.selectbox("Select company", companies)
 payroll_df = payroll_df_raw[payroll_df_raw["company"] == selected_company].copy()
 
 # ---------------------------------------------------------------------------
-# Load all bank statements
+# Load ALL bank statements (always merged across all files)
 # ---------------------------------------------------------------------------
-all_bank_dfs = []
-for be in bank_entries:
-    bdf = load_bank(be["path"])
-    if not bdf.empty:
-        all_bank_dfs.append(bdf)
+@st.cache_data(show_spinner="Parsing bank statements…")
+def load_all_bank(paths: tuple) -> pd.DataFrame:
+    frames = []
+    for path in paths:
+        bdf = parse_bank(path)
+        if not bdf.empty:
+            bdf["source_file"] = os.path.basename(path)
+            frames.append(bdf)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
 
-bank_df = pd.concat(all_bank_dfs, ignore_index=True) if all_bank_dfs else pd.DataFrame()
+bank_df = load_all_bank(tuple(e["path"] for e in bank_entries))
 
 # ---------------------------------------------------------------------------
 # Apply overrides to payroll before matching
@@ -309,21 +341,24 @@ with tab_main:
         st.divider()
         st.subheader(f"Payroll History — {selected_emp_name}")
         history_rows = []
-        for entry in payroll_entries:
-            df_raw = load_payroll(entry["path"], entry["year"], entry["month"])
+        for (hy, hm), h_entries in sorted(month_to_entries.items()):
+            df_raw = load_payroll_for_month(
+                [(e["path"], e["year"], e["month"]) for e in h_entries]
+            )
             if df_raw.empty:
                 continue
             emp_hist = df_raw[(df_raw["employee_id"] == emp_id) &
                               (df_raw["company"] == selected_company)]
             if not emp_hist.empty:
                 r = emp_hist.iloc[0]
-                ov_h = get_override(selected_company, emp_id, entry["year"], entry["month"])
+                ov_h = get_override(selected_company, emp_id, hy, hm)
                 gross = ov_h.get("gross_override") or r["gross_salary"]
                 net = ov_h.get("net_override") or r["net_salary"]
                 history_rows.append({
-                    "Month": f"{calendar.month_name[entry['month']]} {entry['year']}",
+                    "Month": f"{calendar.month_name[hm]} {hy}",
                     "Gross": f"€{gross:,.2f}",
                     "Net": f"€{net:,.2f}",
+                    "Files": len(h_entries),
                 })
         if history_rows:
             st.dataframe(pd.DataFrame(history_rows), use_container_width=True, hide_index=True)
@@ -360,7 +395,7 @@ with tab_bank:
         diag["candidate_for_month"] = candidate_mask
         diag["amount_fmt"] = diag["amount"].map(lambda x: f"€{x:,.2f}")
 
-        show_cols = ["booking_date", "recipient", "purpose", "amount_fmt",
+        show_cols = ["source_file", "booking_date", "recipient", "purpose", "amount_fmt",
                      "booking_month", "booking_year", "month", "year", "candidate_for_month"]
         available = [c for c in show_cols if c in diag.columns]
         st.dataframe(diag[available].rename(columns={
@@ -419,9 +454,16 @@ with tab_files:
     c1, c2 = st.columns(2)
     with c1:
         st.markdown(f"**Payroll files ({len(files['payroll'])})**")
-        for e in files["payroll"]:
-            ym = f"{calendar.month_name[e['month']]} {e['year']}" if e.get("month") else "unknown month"
-            st.caption(f"📄 {ym} — {e['path']}")
+        for (hy, hm), h_entries in sorted(month_to_entries.items()):
+            label = f"{calendar.month_name[hm]} {hy}"
+            st.markdown(f"**{label}** — {len(h_entries)} file(s)")
+            for e in h_entries:
+                st.caption(f"  📄 {e['path']}")
+        if [e for e in files["payroll"] if not e.get("month")]:
+            st.markdown("**Unknown month**")
+            for e in files["payroll"]:
+                if not e.get("month"):
+                    st.caption(f"  📄 {e['path']}")
     with c2:
         st.markdown(f"**Bank files ({len(files['bank'])})**")
         for e in files["bank"]:
