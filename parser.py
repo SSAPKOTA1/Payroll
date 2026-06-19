@@ -123,48 +123,73 @@ def parse_payroll(filepath: str, year: int = None, month: int = None) -> pd.Data
 # Bank transfer parser — column-count flexible
 # ---------------------------------------------------------------------------
 
-# Headers we look for (lowercase, stripped). Multiple aliases per field.
-_BANK_FIELD_ALIASES = {
-    "booking_date": ["buchungstag", "buchungsdatum", "datum", "date", "valutadatum"],
-    "recipient":    [
+# Priority-ordered alias lists (index 0 = highest priority).
+# When multiple columns match the same field, the one whose alias has the
+# LOWEST index wins.  Keep the most specific/unambiguous names first.
+_BANK_FIELD_PRIORITY: dict[str, list[str]] = {
+    "booking_date": [
+        "buchungstag", "buchungsdatum", "datum", "date",
+        "valutadatum",                       # lower priority – value date, not booking date
+    ],
+    "recipient": [
         "beguenstigter/zahlungspflichtiger",
         "beguenstigter",
         "zahlungspflichtiger",
         "kontoinhaber",
-        "empfaenger",
-        "empfänger",
-        "name",
-        "account holder",
-        "recipient",
+        "empfaenger", "empfänger",
+        "account holder", "recipient",
         "auftraggeber",
+        "name",
     ],
-    "purpose":      ["verwendungszweck", "bemerkung", "betreff", "purpose",
-                     "beschreibung", "buchungstext", "text", "referenz",
-                     "zahlungsgrund", "mitteilung"],
-    "amount":       ["betrag", "amount", "umsatz", "buchungsbetrag"],
-    "iban":         ["kontonummer/iban", "iban", "kontonummer", "konto"],
+    "purpose": [
+        "verwendungszweck",                  # most important – always prefer this
+        "bemerkung", "betreff",
+        "zahlungsgrund", "mitteilung",
+        "beschreibung", "purpose",
+        # intentionally NOT including buchungstext / mandatsreferenz /
+        # kundenreferenz / sammlerreferenz — those are meta-fields, not the
+        # actual payment description
+    ],
+    "amount": [
+        "betrag",                            # THE booked amount column
+        "buchungsbetrag",
+        "amount", "umsatz",
+        # intentionally NOT "lastschrift ursprungsbetrag" — that is the
+        # original mandate amount before adjustments and is often empty
+    ],
+    "iban": [
+        "kontonummer/iban", "iban",
+        "kontonummer", "konto",
+    ],
 }
 
 
-def _detect_col(header_lower: str) -> str | None:
-    """Return the logical field name for a column header string, or None."""
+def _detect_col(header_lower: str) -> tuple[str, int] | tuple[None, None]:
+    """
+    Return (field_name, priority) for a column header string.
+    priority = alias index (lower = more important).
+    Returns (None, None) if no match.
+    """
     h = header_lower.strip().strip('"').strip()
-    for field, aliases in _BANK_FIELD_ALIASES.items():
+    for field, aliases in _BANK_FIELD_PRIORITY.items():
         if h in aliases:
-            return field
-    # Partial match fallback
-    for field, aliases in _BANK_FIELD_ALIASES.items():
-        for alias in aliases:
+            return field, aliases.index(h)
+    # Partial-match fallback (high priority value so exact matches win)
+    for field, aliases in _BANK_FIELD_PRIORITY.items():
+        for i, alias in enumerate(aliases):
             if alias in h or h in alias:
-                return field
-    return None
+                return field, len(aliases) + i   # lower priority than exact
+    return None, None
 
 
 def parse_bank(filepath: str) -> pd.DataFrame:
     """
     Parse a German bank export CSV.
     Column count may vary between banks/exports — the parser detects
-    columns by header name using a broad alias list.
+    columns by header name using a priority-ordered alias list.
+    When multiple columns match the same logical field (e.g. both
+    'Buchungstext' and 'Verwendungszweck' could be 'purpose'), the one
+    with the lower alias-list index wins.
 
     Returned columns:
       booking_date, booking_year, booking_month,
@@ -187,12 +212,17 @@ def parse_bank(filepath: str) -> pd.DataFrame:
     if header_idx is None:
         return pd.DataFrame()
 
-    # Map logical field → column index (first match wins)
+    # Map logical field → column index, using priority order.
+    # col_priority tracks the best (lowest) priority seen so far per field.
     col_map: dict[str, int] = {}
+    col_priority: dict[str, int] = {}
     for j, h in enumerate(header_row):
-        field = _detect_col(h.strip().lower().strip('"'))
-        if field and field not in col_map:
-            col_map[field] = j
+        field, priority = _detect_col(h.strip().lower().strip('"'))
+        if field is None:
+            continue
+        if field not in col_priority or priority < col_priority[field]:
+            col_map[field]      = j
+            col_priority[field] = priority
 
     def _cell(row: list, field: str) -> str:
         idx = col_map.get(field)
