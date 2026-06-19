@@ -15,6 +15,24 @@ Payroll/
 └── overrides.db    # Created automatically on first run
 ```
 
+## Data Folder Layout
+
+Place your files anywhere under `/data/` (or any root you configure). The app scans all subfolders recursively — folder depth does not matter.
+
+```
+/data/
+├── 2026/
+│   ├── Mai/
+│   │   └── lojo_202605_0001595_00419_00000.csv   ← payroll
+│   └── Juni/
+│       └── bank/
+│           └── umsatz_20260619.csv               ← bank statement
+└── 2025/
+    └── ...
+```
+
+Add new monthly payroll files at any time; click **Scan / Refresh** in the sidebar to pick them up.
+
 ## Setup
 
 ```bash
@@ -34,7 +52,7 @@ The app opens at http://localhost:8501 in your browser.
 
 ## How to Use
 
-1. **Set the root directory** in the sidebar (default: `D:\` on Windows).  
+1. **Set the root directory** in the sidebar (default: `/data`).  
    The app scans all subfolders recursively.
 2. Click **Scan / Refresh** after adding new files.
 3. **Select a month** — the most recent payroll month is loaded automatically.

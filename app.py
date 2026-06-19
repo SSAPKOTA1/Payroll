@@ -59,7 +59,7 @@ def load_bank(path: str):
 # ---------------------------------------------------------------------------
 st.sidebar.title("⚙️ Configuration")
 
-default_root = r"D:\\" if os.name == "nt" else str(Path.home())
+default_root = "/data"
 root_dir = st.sidebar.text_input("Root scan directory", value=default_root)
 
 scan_btn = st.sidebar.button("🔍 Scan / Refresh", use_container_width=True)
