@@ -373,76 +373,91 @@ with tab_bank:
     st.subheader("Bank Statement — All Loaded Transfers")
 
     if bank_df.empty:
-        st.warning("No bank statement files were detected. Check that your bank CSV files are under the scan root and contain 'Buchungstag' or 'Verwendungszweck' headers (or 'umsatz' in the filename).")
+        st.warning("No bank statement files detected. Check that your bank CSV files are under the scan root and contain 'Buchungstag'/'Verwendungszweck' headers (or 'umsatz' in the filename).")
     else:
-        st.success(f"**{len(bank_df)} transfers loaded** from {len(bank_entries)} bank file(s).")
-
-        # Which transfers are candidates for this payroll month?
-        candidate_mask = bank_df.apply(
+        from matcher import is_salary_transfer as _is_salary
+        diag = bank_df.copy()
+        diag["is_salary"] = diag["purpose"].apply(lambda p: _is_salary(str(p)))
+        diag["candidate_for_month"] = diag.apply(
             lambda r: _transfer_is_candidate(r, sel_year, sel_month), axis=1
         )
-        n_candidates = candidate_mask.sum()
+        diag["amount_fmt"] = diag["amount"].map(lambda x: f"€{x:,.2f}")
+        diag["abs_amount_fmt"] = diag["amount"].map(lambda x: f"€{abs(x):,.2f}")
 
-        st.info(
-            f"**{n_candidates}** of {len(bank_df)} transfers are candidates for "
-            f"**{selected_month_label}** "
-            f"(booking date in {calendar.month_name[sel_month]}/{sel_year} or month+1, "
-            f"or purpose mentions the same month)."
+        n_salary = diag["is_salary"].sum()
+        n_candidates = diag["candidate_for_month"].sum()
+        n_salary_candidates = (diag["is_salary"] & diag["candidate_for_month"]).sum()
+
+        st.success(
+            f"**{len(bank_df)} transfers loaded** from {len(bank_entries)} bank file(s) · "
+            f"**{n_salary} salary transfers** (Gehalt/Lohn in purpose) · "
+            f"**{n_salary_candidates} salary candidates** for {selected_month_label}"
         )
 
-        # Show all transfers with a "candidate?" column
-        diag = bank_df.copy()
-        diag["candidate_for_month"] = candidate_mask
-        diag["amount_fmt"] = diag["amount"].map(lambda x: f"€{x:,.2f}")
+        if n_salary == 0:
+            st.warning(
+                "No transfers with **Gehalt / Lohn / Salary** in the purpose were found. "
+                "If your bank export uses a different keyword, the app falls back to matching "
+                "all candidate transfers by name. Check the 'Purpose' column below."
+            )
 
-        show_cols = ["source_file", "booking_date", "recipient", "purpose", "amount_fmt",
-                     "booking_month", "booking_year", "month", "year", "candidate_for_month"]
+        show_cols = ["source_file", "booking_date", "recipient", "purpose",
+                     "amount_fmt", "abs_amount_fmt", "is_salary",
+                     "booking_month", "booking_year", "month", "year",
+                     "candidate_for_month"]
         available = [c for c in show_cols if c in diag.columns]
-        st.dataframe(diag[available].rename(columns={
-            "booking_date": "Date",
-            "recipient": "Recipient",
-            "purpose": "Purpose",
-            "amount_fmt": "Amount",
-            "booking_month": "Bk.Month",
-            "booking_year": "Bk.Year",
-            "month": "Purpose Month",
-            "year": "Purpose Year",
-            "candidate_for_month": "Candidate?",
-        }), use_container_width=True, hide_index=True)
+        st.dataframe(
+            diag[available].rename(columns={
+                "source_file": "File",
+                "booking_date": "Date",
+                "recipient": "Account Holder (Recipient)",
+                "purpose": "Purpose (Verwendungszweck)",
+                "amount_fmt": "Amount (raw)",
+                "abs_amount_fmt": "Amount (abs)",
+                "is_salary": "Salary Transfer?",
+                "booking_month": "Bk.Month",
+                "booking_year": "Bk.Year",
+                "month": "Purpose Month",
+                "year": "Purpose Year",
+                "candidate_for_month": "Candidate?",
+            }),
+            use_container_width=True, hide_index=True
+        )
 
         st.divider()
-        st.subheader("Why didn't a transfer match an employee?")
+        st.subheader("Fuzzy match scores — employees vs salary transfers")
         st.markdown(
-            "Transfers marked **Candidate? = True** were considered. "
-            "If they still didn't match, it means the employee name in the bank "
-            "statement did not score ≥ 72 against any payroll employee name.\n\n"
-            "**Common causes:**\n"
-            "- The bank statement uses a company name instead of employee name in the Recipient field\n"
-            "- The employee name appears only in the Purpose/Verwendungszweck field\n"
-            "- Spelling is too different (fuzzy threshold not met)\n"
-            "- The transfer is for a different month than the payroll\n\n"
-            "**Fix:** Use the **Manual Override** in the Dashboard tab to set the paid amount or force status."
+            "Shows how each payroll employee name scores against the **Account Holder** "
+            "(Beguenstigter) and **Purpose** fields of every salary-candidate transfer. "
+            "Threshold for a match is **72**."
         )
 
-        # Show employee name ↔ recipient scores for debugging
-        if not bank_df.empty and not payroll_df.empty:
-            with st.expander("Show fuzzy match scores (all employees vs all candidate transfers)"):
-                from matcher import _score
-                candidates = bank_df[candidate_mask].reset_index(drop=True)
+        if not payroll_df.empty:
+            salary_cands = diag[diag["candidate_for_month"]].reset_index(drop=True)
+            # If salary-tagged rows exist, show only those; else show all candidates
+            if diag["is_salary"].any():
+                salary_cands = diag[diag["is_salary"] & diag["candidate_for_month"]].reset_index(drop=True)
+
+            if salary_cands.empty:
+                st.info("No salary-candidate transfers to score against.")
+            else:
+                from matcher import _score as _fscore
                 score_rows = []
                 for _, emp in payroll_df.iterrows():
-                    for _, tr in candidates.iterrows():
-                        sr = _score(emp["employee_name"], str(tr.get("recipient", "")))
-                        sp = _score(emp["employee_name"], str(tr.get("purpose", "")))
+                    for _, tr in salary_cands.iterrows():
+                        sr = _fscore(emp["employee_name"], str(tr.get("recipient", "")))
+                        sp = _fscore(emp["employee_name"], str(tr.get("purpose", "")))
+                        best = max(sr, sp)
                         score_rows.append({
                             "Employee": emp["employee_name"],
-                            "Recipient": str(tr.get("recipient", ""))[:50],
-                            "Score (recipient)": sr,
+                            "Account Holder": str(tr.get("recipient", ""))[:50],
+                            "Purpose": str(tr.get("purpose", ""))[:50],
+                            "Score (holder)": sr,
                             "Score (purpose)": sp,
-                            "Best": max(sr, sp),
-                            "Matched?": "✅" if max(sr, sp) >= 72 else "❌",
+                            "Best Score": best,
+                            "Matched?": "✅" if best >= 72 else "❌",
                         })
-                score_df = pd.DataFrame(score_rows).sort_values("Best", ascending=False)
+                score_df = pd.DataFrame(score_rows).sort_values("Best Score", ascending=False)
                 st.dataframe(score_df, use_container_width=True, hide_index=True)
 
 
