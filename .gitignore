@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pyo
+overrides.db
+.venv/
+*.egg-info/
