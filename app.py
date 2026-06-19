@@ -379,72 +379,70 @@ with tab_bank:
             "contain 'Buchungstag'/'Verwendungszweck' headers (or 'umsatz' in the filename)."
         )
     else:
-        from matcher import is_salary_transfer as _is_salary, score_names as _score_names
+        from matcher import is_salary_row as _is_salary_row, names_match as _names_match, name_tokens as _name_tokens
 
         diag = bank_df.copy()
-        diag["is_salary"] = diag["purpose"].apply(lambda p: _is_salary(str(p)))
-        diag["candidate_for_month"] = diag.apply(
-            lambda r: _transfer_is_candidate(r, sel_year, sel_month), axis=1
-        )
-        diag["amount_fmt"]     = diag["amount"].map(lambda x: f"€{x:,.2f}")
-        diag["abs_amount_fmt"] = diag["amount"].map(lambda x: f"€{abs(x):,.2f}")
+        row_text_col = diag["row_text"] if "row_text" in diag.columns else diag.get("purpose", pd.Series([""] * len(diag)))
+        diag["is_salary"]           = row_text_col.apply(lambda t: _is_salary_row(str(t)))
+        diag["candidate_for_month"] = diag.apply(lambda r: _transfer_is_candidate(r, sel_year, sel_month), axis=1)
+        diag["amount_fmt"]          = diag["amount"].map(lambda x: f"€{x:,.2f}")
+        diag["abs_amount_fmt"]      = diag["amount"].map(lambda x: f"€{abs(x):,.2f}")
 
         n_salary            = int(diag["is_salary"].sum())
         n_salary_candidates = int((diag["is_salary"] & diag["candidate_for_month"]).sum())
 
         if n_salary == 0:
             st.warning(
-                f"**{len(bank_df)} transfers loaded** but **none** have Gehalt/Lohn/Salary "
-                "in the Verwendungszweck. The app will fall back to matching ALL candidate "
-                "transfers by account holder name. Check the Purpose column below — "
-                "if it's empty or uses a different keyword, salary detection won't work."
+                f"**{len(bank_df)} transfers loaded** — **no salary keyword** (Gehalt/Lohn/…) "
+                "found in any column. The app falls back to matching ALL candidate transfers "
+                "by account-holder name. Check the 'All Columns Text' column below."
             )
         else:
             st.success(
                 f"**{len(bank_df)} transfers loaded** from {len(bank_entries)} file(s) · "
-                f"**{n_salary} salary transfers** (Gehalt/Lohn keyword detected) · "
+                f"**{n_salary} salary rows** (Gehalt/Lohn keyword in any column) · "
                 f"**{n_salary_candidates} salary candidates** for {selected_month_label}"
             )
 
-        # --- Raw parsed data -----------------------------------------------
-        with st.expander("📋 Raw parsed columns — verify the parser reads your file correctly", expanded=True):
+        # --- Raw parsed rows -----------------------------------------------
+        with st.expander("📋 Raw parsed rows — verify account holder name and Gehalt keyword", expanded=True):
             st.caption(
-                "This shows exactly what the parser extracted from your bank CSV. "
-                "**Account Holder** must contain the employee name. "
-                "**Purpose** must contain Gehalt/Lohn + month. "
-                "If these columns look wrong, check column headers in your CSV."
+                "**Account Holder** = Beguenstigter/Zahlungspflichtiger column — must contain the employee name.  "
+                "**Purpose** = Verwendungszweck column.  "
+                "**All Columns Text** = every cell in the row joined — salary keyword is searched here.  "
+                "If any column looks wrong your CSV may use different column headers."
             )
-            show_cols = ["source_file", "booking_date", "recipient", "purpose",
-                         "amount_fmt", "abs_amount_fmt",
-                         "is_salary", "booking_month", "booking_year",
-                         "month", "year", "candidate_for_month"]
+            show_cols = ["source_file", "booking_date", "recipient", "purpose", "row_text",
+                         "amount_fmt", "abs_amount_fmt", "is_salary",
+                         "booking_month", "booking_year", "month", "year", "candidate_for_month"]
             available = [c for c in show_cols if c in diag.columns]
             st.dataframe(
                 diag[available].rename(columns={
-                    "source_file":      "File",
-                    "booking_date":     "Booking Date",
-                    "recipient":        "Account Holder (Beguenstigter)",
-                    "purpose":          "Purpose (Verwendungszweck)",
-                    "amount_fmt":       "Amount (raw)",
-                    "abs_amount_fmt":   "Amount (abs)",
-                    "is_salary":        "Gehalt/Lohn?",
-                    "booking_month":    "Bk.Month",
-                    "booking_year":     "Bk.Year",
-                    "month":            "Purpose Month",
-                    "year":             "Purpose Year",
-                    "candidate_for_month": f"Candidate for {selected_month_label}?",
+                    "source_file":          "File",
+                    "booking_date":         "Booking Date",
+                    "recipient":            "Account Holder (Beguenstigter)",
+                    "purpose":              "Purpose (Verwendungszweck)",
+                    "row_text":             "All Columns Text",
+                    "amount_fmt":           "Amount (raw)",
+                    "abs_amount_fmt":       "Amount (abs used)",
+                    "is_salary":            "Gehalt/Lohn found?",
+                    "booking_month":        "Bk.Month",
+                    "booking_year":         "Bk.Year",
+                    "month":                "Purpose Month",
+                    "year":                 "Purpose Year",
+                    "candidate_for_month":  f"Candidate for {selected_month_label}?",
                 }),
                 use_container_width=True, hide_index=True
             )
 
-        # --- Fuzzy match scores ---------------------------------------------
+        # --- Token-match results -------------------------------------------
         st.divider()
-        st.subheader("Fuzzy match scores")
+        st.subheader("Name token matching — employees vs salary candidates")
         st.markdown(
-            "Every payroll employee scored against every salary-candidate transfer. "
-            "Match threshold: **65**. Scores use token-set, token-sort, partial, "
-            "and token-overlap methods — any token order (Müller Hans / Hans Müller / "
-            "HANS MUELLER) all score 100."
+            "**Exact token matching**: every name token from the payroll "
+            "(e.g. `aryal`, `ramesh`) must appear in the bank account-holder tokens.  "
+            "Any name order works: `Ramesh Aryal`, `ARYAL RAMESH`, `Aryal, Ramesh` all match.  "
+            "Umlauts are folded: `Müller` = `mueller`."
         )
 
         if not payroll_df.empty:
@@ -453,27 +451,26 @@ with tab_bank:
                 cand_pool = diag[diag["is_salary"] & diag["candidate_for_month"]].reset_index(drop=True)
 
             if cand_pool.empty:
-                st.info("No candidate transfers to score. Try clicking 'Scan / Refresh' or check the month selector.")
+                st.info("No candidate transfers found for this month.")
             else:
-                score_rows = []
+                match_rows = []
                 for _, emp in payroll_df.iterrows():
                     for _, tr in cand_pool.iterrows():
-                        holder  = str(tr.get("recipient", "") or "")
-                        purpose = str(tr.get("purpose",   "") or "")
-                        sh = _score_names(emp["employee_name"], holder)
-                        sp = _score_names(emp["employee_name"], purpose)
-                        best = max(sh, sp)
-                        score_rows.append({
-                            "Employee (payroll)":       emp["employee_name"],
-                            "Account Holder (bank)":    holder[:50],
-                            "Purpose":                  purpose[:60],
-                            "Score vs Holder":          sh,
-                            "Score vs Purpose":         sp,
-                            "Best Score":               best,
-                            "Matched? (≥65)":           "✅ YES" if best >= 65 else "❌ NO",
+                        holder = str(tr.get("recipient", "") or "")
+                        matched, reason = _names_match(emp["employee_name"], holder)
+                        pt = sorted(_name_tokens(emp["employee_name"]))
+                        bt = sorted(_name_tokens(holder))
+                        match_rows.append({
+                            "Employee (payroll)":    emp["employee_name"],
+                            "Payroll tokens":        str(pt),
+                            "Account Holder (bank)": holder[:60],
+                            "Bank tokens":           str(bt),
+                            "Salary kw?":            "✅" if tr.get("is_salary") else "❌",
+                            "Name match?":           "✅ YES" if matched else "❌ NO",
+                            "Detail":                reason,
                         })
-                score_df = pd.DataFrame(score_rows).sort_values("Best Score", ascending=False)
-                st.dataframe(score_df, use_container_width=True, hide_index=True)
+                match_df = pd.DataFrame(match_rows).sort_values("Name match?", ascending=False)
+                st.dataframe(match_df, use_container_width=True, hide_index=True)
 
 
 # ===========================================================================

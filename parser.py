@@ -120,14 +120,56 @@ def parse_payroll(filepath: str, year: int = None, month: int = None) -> pd.Data
 
 
 # ---------------------------------------------------------------------------
-# Bank transfer parser
+# Bank transfer parser — column-count flexible
 # ---------------------------------------------------------------------------
+
+# Headers we look for (lowercase, stripped). Multiple aliases per field.
+_BANK_FIELD_ALIASES = {
+    "booking_date": ["buchungstag", "buchungsdatum", "datum", "date", "valutadatum"],
+    "recipient":    [
+        "beguenstigter/zahlungspflichtiger",
+        "beguenstigter",
+        "zahlungspflichtiger",
+        "kontoinhaber",
+        "empfaenger",
+        "empfänger",
+        "name",
+        "account holder",
+        "recipient",
+        "auftraggeber",
+    ],
+    "purpose":      ["verwendungszweck", "bemerkung", "betreff", "purpose",
+                     "beschreibung", "buchungstext", "text", "referenz",
+                     "zahlungsgrund", "mitteilung"],
+    "amount":       ["betrag", "amount", "umsatz", "buchungsbetrag"],
+    "iban":         ["kontonummer/iban", "iban", "kontonummer", "konto"],
+}
+
+
+def _detect_col(header_lower: str) -> str | None:
+    """Return the logical field name for a column header string, or None."""
+    h = header_lower.strip().strip('"').strip()
+    for field, aliases in _BANK_FIELD_ALIASES.items():
+        if h in aliases:
+            return field
+    # Partial match fallback
+    for field, aliases in _BANK_FIELD_ALIASES.items():
+        for alias in aliases:
+            if alias in h or h in alias:
+                return field
+    return None
+
 
 def parse_bank(filepath: str) -> pd.DataFrame:
     """
-    Parse a German bank export CSV (Sparkasse/Nassauische Sparkasse format).
-    Returns DataFrame with columns:
-      booking_date, recipient, purpose, amount, iban, year, month
+    Parse a German bank export CSV.
+    Column count may vary between banks/exports — the parser detects
+    columns by header name using a broad alias list.
+
+    Returned columns:
+      booking_date, booking_year, booking_month,
+      recipient, purpose, row_text,
+      amount, iban, year, month
     """
     rows = _read_raw(filepath)
 
@@ -135,7 +177,9 @@ def parse_bank(filepath: str) -> pd.DataFrame:
     header_row = None
     for i, row in enumerate(rows):
         joined = " ".join(row).lower()
-        if "buchungstag" in joined or "verwendungszweck" in joined:
+        if ("buchungstag" in joined or "verwendungszweck" in joined
+                or "betrag" in joined or "buchungsdatum" in joined
+                or "beguenstigter" in joined):
             header_idx = i
             header_row = row
             break
@@ -143,60 +187,63 @@ def parse_bank(filepath: str) -> pd.DataFrame:
     if header_idx is None:
         return pd.DataFrame()
 
-    col_map = {}
+    # Map logical field → column index (first match wins)
+    col_map: dict[str, int] = {}
     for j, h in enumerate(header_row):
-        h_lower = h.strip().lower().strip('"')
-        if h_lower == "buchungstag":
-            col_map["booking_date"] = j
-        elif h_lower in ("beguenstigter/zahlungspflichtiger",):
-            col_map["recipient"] = j
-        elif h_lower == "verwendungszweck":
-            col_map["purpose"] = j
-        elif h_lower == "betrag":
-            col_map["amount"] = j
-        elif h_lower in ("kontonummer/iban",):
-            col_map["iban"] = j
+        field = _detect_col(h.strip().lower().strip('"'))
+        if field and field not in col_map:
+            col_map[field] = j
+
+    def _cell(row: list, field: str) -> str:
+        idx = col_map.get(field)
+        if idx is None or idx >= len(row):
+            return ""
+        return row[idx].strip().strip('"').strip()
 
     records = []
     for row in rows[header_idx + 1:]:
         if not row or not any(r.strip() for r in row):
             continue
-        amount_raw = row[col_map["amount"]].strip().strip('"') if "amount" in col_map else "0"
+
+        # Full row text for salary-keyword scanning (ALL columns)
+        row_text = " ".join(c.strip().strip('"') for c in row if c.strip())
+
+        booking_date = _cell(row, "booking_date")
+        recipient    = _cell(row, "recipient")
+        purpose      = _cell(row, "purpose")
+        iban         = _cell(row, "iban")
+
+        amount_raw = _cell(row, "amount") or "0"
         amount = _parse_german_number(amount_raw)
 
-        purpose = row[col_map["purpose"]].strip().strip('"') if "purpose" in col_map else ""
-        recipient = row[col_map["recipient"]].strip().strip('"') if "recipient" in col_map else ""
-        booking_date = row[col_map["booking_date"]].strip().strip('"') if "booking_date" in col_map else ""
-        iban = row[col_map["iban"]].strip().strip('"') if "iban" in col_map else ""
-
-        # Try to get month from purpose text first, then fall back to booking date
-        ym = extract_month_from_text(purpose)
-        year = ym[0] if ym else None
+        # Month extraction: try purpose first, then full row text
+        ym = extract_month_from_text(purpose) or extract_month_from_text(row_text)
+        year  = ym[0] if ym else None
         month = ym[1] if ym else None
 
-        # Parse booking date to get booking_year / booking_month
-        booking_year = None
-        booking_month = None
+        # Parse booking date
+        booking_year = booking_month = None
         if booking_date:
-            # Formats: DD.MM.YY  or  DD.MM.YYYY
             bd_m = re.match(r"(\d{1,2})\.(\d{1,2})\.(\d{2,4})", booking_date)
             if bd_m:
                 d_year = int(bd_m.group(3))
                 if d_year < 100:
                     d_year += 2000
-                booking_year = d_year
+                booking_year  = d_year
                 booking_month = int(bd_m.group(2))
 
         records.append({
-            "booking_date": booking_date,
-            "booking_year": booking_year,
+            "booking_date":  booking_date,
+            "booking_year":  booking_year,
             "booking_month": booking_month,
-            "recipient": recipient,
-            "purpose": purpose,
-            "amount": amount,
-            "iban": iban,
-            "year": year,      # from purpose text
-            "month": month,    # from purpose text
+            "recipient":     recipient,
+            "purpose":       purpose,
+            "row_text":      row_text,   # full row — used for salary-keyword scan
+            "amount":        amount,
+            "iban":          iban,
+            "year":          year,
+            "month":         month,
         })
 
     return pd.DataFrame(records)
+
